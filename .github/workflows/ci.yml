@@ -1,81 +1,88 @@
-name: CI
+name: CI Benchmark (No Cache)
 
 on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: '3.14'
+  FLAKY_TESTS: keep_retrying
+  CLANG_VERSION: '19'
+  CC: clang-19
+  CXX: clang++-19
+  SCCACHE_GHA_ENABLED: 'false'
+  SCCACHE_DISABLE: '1'
+  RUSTC_VERSION: '1.82'
+
+permissions:
+  contents: read
 
 jobs:
-  test:
-    runs-on: ubuntu-24.04
+  benchmark:
+    name: Run on ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
     strategy:
+      fail-fast: false
       matrix:
-        include:
-          - python-version: "3.10"
-            debian-version: trixie
-          - python-version: "3.12"
-            debian-version: trixie
-          - python-version: "3.13"
-            debian-version: trixie
-          - python-version: "3.14"
-            debian-version: trixie
+        # Comparing your custom high-IOPS runner against the GitHub standard
+        runner: [monkci-ubuntu-24.04-4-3600iops, ubuntu-latest]
+    
+    # Using the container setup from your original CI to match the environment
     container:
-      image: python:${{ matrix.python-version }}-${{ matrix.debian-version }}
+      image: python:3.14-trixie
+
     steps:
-      - uses: actions/checkout@v6
-      - name: Install dependencies
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          lfs: false
+
+      - name: System Cleanup (No Cache)
         run: |
+          apt-get clean
+          rm -rf /var/lib/apt/lists/*
           apt-get update
-          apt-get install -y --no-install-recommends gettext make
-      - name: Install nox
-        run: pip install nox
-      - name: Run tests
-        run: nox -x --session "test-${{ matrix.python-version }}"
+          apt-get install -y --no-install-recommends fio gettext make clang-19
+
+      - name: Install Rust ${{ env.RUSTC_VERSION }}
+        run: |
+          # Ensure rustup is available (may need install if not in container)
+          if ! command -v rustup &> /dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            source $HOME/.cargo/env
+          fi
+          rustup override set "$RUSTC_VERSION"
+          rm -rf ~/.cargo/registry ~/.cargo/git target/
+
+      - name: Install Nox
+        run: pip install --no-cache-dir nox
+
+      ---
+      ## BENCHMARK PHASE 1: Build/Test
+      ---
+
+      - name: Build (No Cache)
+        run: |
+          echo "CC=$CC"
+          echo "CXX=$CXX"
+          # Clean build from scratch
+          make build-ci -j4 V=1 CONFIG_FLAGS="--error-on-warn"
+        env:
+          SCCACHE_DISABLE: '1'
+
+      - name: Run Python Tests
+        run: nox -x --session "test-${{ env.PYTHON_VERSION }}"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  docs:
-    runs-on: ubuntu-22.04
-    needs: []
-    strategy:
-      matrix:
-        python-version: [3.14]
-    container:
-      image: python:3.14-trixie
-    steps:
-      - uses: actions/checkout@v6
-      - name: Install nox
-        run: pip install nox
-      - name: Build docs
-        run: nox -x --session "docs"
+      ---
+      ## BENCHMARK PHASE 2: Static Analysis
+      ---
 
-  lint:
-    runs-on: ubuntu-22.04
-    needs: []
-    strategy:
-      matrix:
-        python-version: [3.14]
-    container:
-      image: python:3.14-trixie
-    steps:
-      - uses: actions/checkout@v6
-      - name: Install nox
-        run: pip install nox
-      - name: Run linter
+      - name: Run Linter
         run: nox -x -t lint
 
-  standardjs:
-    runs-on: ubuntu-24.04
-    needs: []
-    strategy:
-      matrix:
-        python-version: [3.14]
-    container:
-      image: node:22-trixie
-    steps:
-      - uses: actions/checkout@v6
-      - name: Install standardjs dependencies
-        run: make ci-install-standardjs
-      - name: Run standardjs
-        run: make standardjs
+      - name: Run JS Standards
+        run: |
+          make ci-install-standardjs
+          make standardjs
